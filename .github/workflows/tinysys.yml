@@ -1,0 +1,126 @@
+name: publish tinysys
+
+# 源码在私有库 LOVECHEN/tinysys-private。本公开库【不含源码】，只在此跑构建
+# ——公开 repo 的 GitHub Actions 无限免费。触发时把私有源 checkout 下来构建、推 Docker Hub。
+#
+# 需 3 个 secret（Settings → Secrets and variables → Actions）：
+#   TINYSYS_SRC_PAT    = fine-grained PAT，仅授权 tinysys-private、权限只勾 Contents: Read-only（拉私有源用）
+#   DOCKERHUB_USERNAME = 你的 Docker Hub 用户名
+#   DOCKERHUB_TOKEN    = Docker Hub Access Token（Read & Write）
+#
+# ★ 触发：每 4h schedule 自动检查更新 + 手动 workflow_dispatch（都在本 repo 上下文、有 secret；
+#   不挂 pull_request，fork PR 拿不到 secret）。无更新则整轮秒跳过（幂等），不吃公开 repo 的无限免费额度。
+#   README【默认不同步】，只有手动传 sync_readme=1 才同步（schedule/普通构建都不碰 README）。
+# ⚠ GitHub 会在 repo 连续 60 天无提交后自动停用 schedule；破局方法见文末注释。
+on:
+  schedule:
+    - cron: '23 */4 * * *'      # 每 4 小时（UTC，高峰期可能被 GitHub 延迟几分钟，不影响“检查更新”）
+  workflow_dispatch:
+    inputs:
+      flavors:
+        description: '口味（空格分隔）：glibc cpp full'
+        default: 'glibc cpp full'
+      platforms:
+        description: '架构（distroless 家族自动去掉上游没有的 riscv64）'
+        default: 'linux/amd64,linux/arm64,linux/arm/v7,linux/ppc64le,linux/riscv64,linux/s390x'
+      push:
+        description: '推送到 Docker Hub（0=只构建不推）'
+        default: '1'
+      sync_readme:
+        description: '同步 README 到 Docker Hub（1=同步；默认 0，只在手动需要时开）'
+        default: '0'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read          # build 不碰 git，只读（keepalive job 才要写）
+    steps:
+      - name: Checkout 私有源码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: LOVECHEN/tinysys-private
+          token: ${{ secrets.TINYSYS_SRC_PAT }}
+          persist-credentials: false
+
+      - name: Checkout 公开 README（同步到 Docker Hub 用，绝不用私有那份带配方的）
+        if: ${{ inputs.sync_readme == '1' }}       # 只有手动请求同步时才拉；schedule/普通构建不碰
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          path: _pub                 # 到子目录，放在私有 checkout 之后（私有 checkout 的 clean 会清根下未跟踪目录）
+          persist-credentials: false
+
+      - name: Set up QEMU (多架构)
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8  # v4.2.0
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4.3.0
+
+      # 不在这里 login：检查阶段（版本探测 + 读 sig）全程匿名读公开镜像。
+      # build-push.sh 只有在幂等判定"要构建"、且要推时，才在推送前用下面的凭据 login。
+      - name: Build & push matrix
+        env:
+          REPO: ${{ secrets.DOCKERHUB_USERNAME }}/tinysys
+          SOURCE: https://hub.docker.com/r/${{ secrets.DOCKERHUB_USERNAME }}/tinysys
+          PLATFORMS: ${{ inputs.platforms || 'linux/amd64,linux/arm64,linux/arm/v7,linux/ppc64le,linux/riscv64,linux/s390x' }}
+          FLAVORS: ${{ inputs.flavors || 'glibc cpp full' }}
+          PUSH: ${{ inputs.push || '1' }}
+          # ★ 检查阶段匿名；只有确定要推时 build-push.sh 内部才用这俩 docker login
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          # 失败日志写回私有库 issue（公开日志不留构建细节）
+          GH_TOKEN: ${{ secrets.TINYSYS_SRC_PAT }}
+          LOG_SINK_REPO: ${{ github.repository_owner }}/tinysys-private
+        run: |
+          chmod +x ci/build-push.sh
+          ci/build-push.sh
+
+      # 把【公开】README 同步到 Docker Hub 仓库 Overview（docker push 不会自动带 README）。
+      # 用 secret 认证（token 由 Actions 注入、不落日志）。★ 默认不同步：只有手动传 sync_readme=1 才跑，
+      # 所以 schedule 定时检查、普通构建都不碰 README（不用每次都同步）。
+      - name: 同步公开 README 到 Docker Hub
+        if: ${{ inputs.sync_readme == '1' }}
+        env:
+          DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          DH_PASS: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          JWT=$(curl -fsS -X POST -H "Content-Type: application/json" \
+            -d "$(python3 -c "import json,os;print(json.dumps({'username':os.environ['DH_USER'],'password':os.environ['DH_PASS']}))")" \
+            https://hub.docker.com/v2/users/login/ | python3 -c 'import sys,json;print(json.load(sys.stdin).get("token",""))')
+          [ -n "$JWT" ] || { echo "✗ Docker Hub 登录失败（拿不到 JWT）"; exit 1; }
+          BODY=$(python3 -c "import json;print(json.dumps({'full_description':open('_pub/README.md',encoding='utf-8').read(),'description':'极简 glibc 容器底座 · 25 成品 × 6 架构 · 单层无泄漏'}))")
+          code=$(curl -sS -o /dev/null -w '%{http_code}' -X PATCH \
+            -H "Authorization: JWT $JWT" -H "Content-Type: application/json" \
+            -d "$BODY" "https://hub.docker.com/v2/repositories/${DH_USER}/tinysys/")
+          echo "Docker Hub PATCH → HTTP $code"
+          [ "$code" = "200" ] && echo "✅ 公开 README 已同步到 Docker Hub Overview" \
+            || { echo "✗ 同步失败：若为 401/403，多半是该 token 无「编辑仓库描述」权限——需用有 repo 写权限的 Docker Hub token"; exit 1; }
+
+  # ── keepalive：防 repo 连续 60 天无提交被 GitHub 自动停用 schedule ──────────────
+  # 仅 schedule 触发；距上次提交 ≥50 天才推一个空提交重置计时器（约每 50 天 1 个，极少）。
+  # GITHUB_TOKEN 推送不触发新 workflow（无循环），但算 repo 活动 → 重置 60 天计时。独立 job、仅此 job 有写权限。
+  keepalive:
+    if: ${{ github.event_name == 'schedule' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: 临近 60 天才推空提交
+        run: |
+          days=$(( ( $(date +%s) - $(git log -1 --format=%ct) ) / 86400 ))
+          echo "距上次提交 ${days} 天"
+          if [ "$days" -ge 50 ]; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "chore: keepalive（重置 schedule 60 天计时器）"
+            git push
+            echo "✅ 已推 keepalive 空提交（重置 60 天计时）"
+          else
+            echo "未到阈值(50 天)，无需提交"
+          fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 60 天停用 schedule 的破局：本文件用【A. keepalive】（上面独立 keepalive job）。
+# 想让 main 全程单 commit，可改【B. 外部 cron 调 dispatch API】或【C. 被停用后手动 Enable】。
+# ─────────────────────────────────────────────────────────────────────────────
